@@ -1,0 +1,8 @@
+[package]
+name = "kelvos-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kelvos-shared-ring = { path = "../shared-ring" }
+kelvos-rs-macros = { path = "macros" }
