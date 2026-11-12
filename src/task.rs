@@ -1,119 +1,87 @@
 #[cfg(target_os = "none")]
-use core::sync::atomic::{AtomicBool, Ordering};
+use crate::syscall;
 
-#[cfg(target_os = "none")]
-use kelvos_shared_ring::{Completion, Submission, OP_SPAWN};
+pub use kelvos_shared_ring::{ExitStatus, Pid, Tid, BOOT_CHILD_IMAGE};
 
-#[cfg(target_os = "none")]
-use crate::{memory, syscall};
-
-#[cfg(target_os = "none")]
-static SPAWN_LOCK: AtomicBool = AtomicBool::new(false);
-
-/// Identifies a task created by the kernel.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TaskId(u32);
-
-impl TaskId {
-    /// Returns the kernel-assigned task identifier.
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
+/// Legacy name for the process identifier returned by spawn.
+pub type TaskId = Pid;
 
 /// Reasons a task request could not be completed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     /// The process is not running on the freestanding Kelvos target.
     UnsupportedPlatform,
-    /// Another caller is currently submitting a task request.
-    Busy,
-    /// The shared submission queue has no free entries.
-    QueueFull,
-    /// The kernel did not publish a completion for the request.
-    NoCompletion,
-    /// The kernel completion did not match the submitted request.
+    /// The kernel returned an invalid task identifier.
     Protocol,
     /// The kernel returned a negative error result.
     Kernel(i64),
 }
 
-#[cfg(target_os = "none")]
-struct SpawnGuard;
-
-#[cfg(target_os = "none")]
-impl SpawnGuard {
-    fn acquire() -> Result<Self, Error> {
-        SPAWN_LOCK
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .map(|_| Self)
-            .map_err(|_| Error::Busy)
-    }
+/// Starts the child executable from the boot image registry.
+pub fn spawn() -> Result<Pid, Error> {
+    spawn_image(BOOT_CHILD_IMAGE, 0)
 }
 
-#[cfg(target_os = "none")]
-impl Drop for SpawnGuard {
-    fn drop(&mut self) {
-        SPAWN_LOCK.store(false, Ordering::Release);
-    }
+/// Starts a registered executable and passes one scalar argument to its entry point.
+pub fn spawn_image(image: u64, argument: u64) -> Result<Pid, Error> {
+    Pid::from_raw(identifier(kelvos_shared_ring::SYS_SPAWN, image, argument)?)
+        .ok_or(Error::Protocol)
 }
 
-/// Creates a task using the child image and stack currently supported by the kernel.
-///
-/// The request is serialized with other callers because the kernel ABI exposes a
-/// single-producer/single-consumer shared ring.
-pub fn spawn() -> Result<TaskId, Error> {
+/// Returns the current process identifier.
+pub fn current_pid() -> Result<Pid, Error> {
+    Pid::from_raw(identifier(kelvos_shared_ring::SYS_GET_PID, 0, 0)?).ok_or(Error::Protocol)
+}
+
+/// Returns the current thread identifier.
+pub fn current_tid() -> Result<Tid, Error> {
+    Tid::from_raw(identifier(kelvos_shared_ring::SYS_GET_TID, 0, 0)?).ok_or(Error::Protocol)
+}
+
+fn identifier(number: u64, arg: u64, extra: u64) -> Result<u32, Error> {
+    u32::try_from(request(number, arg, extra)?).map_err(|_| Error::Protocol)
+}
+
+fn request(_number: u64, _arg: u64, _extra: u64) -> Result<u64, Error> {
     #[cfg(not(target_os = "none"))]
     return Err(Error::UnsupportedPlatform);
 
     #[cfg(target_os = "none")]
     {
-        let _guard = SpawnGuard::acquire()?;
-        // The kernel maps this shared ring before entering userspace.
-        let ring = unsafe { memory::shared_ring() };
-        let tail = ring.sq_tail.load(Ordering::Relaxed);
-
-        if !ring.producer_has_space(tail) {
-            return Err(Error::QueueFull);
-        }
-
-        unsafe {
-            ring.write_submission(
-                tail,
-                Submission {
-                    opcode: OP_SPAWN,
-                    flags: 0,
-                    entry_point: memory::spawn_entry_address(),
-                    stack_top: memory::spawn_stack_top(),
-                },
-            );
-        }
-        ring.sq_tail.store(tail.wrapping_add(1), Ordering::Release);
-
-        syscall::notify_ring();
-
-        let head = ring.cq_head.load(Ordering::Relaxed);
-        if !ring.consumer_has_entries(head) {
-            return Err(Error::NoCompletion);
-        }
-
-        let completion: Completion = unsafe { ring.read_completion(head) };
-        ring.cq_head.store(head.wrapping_add(1), Ordering::Release);
-
-        if completion.user_data != u64::from(tail) {
-            return Err(Error::Protocol);
-        }
-        if completion.result < 0 {
-            return Err(Error::Kernel(completion.result));
-        }
-        if completion.result == 0 {
-            return Err(Error::Protocol);
-        }
-
-        u32::try_from(completion.result)
-            .map(TaskId)
-            .map_err(|_| Error::Protocol)
+        let result = syscall::call(_number, _arg, _extra);
+        u64::try_from(result).map_err(|_| Error::Kernel(result))
     }
+}
+
+/// Waits for a direct child and collects its termination status once.
+pub fn wait_child(pid: Pid) -> Result<ExitStatus, Error> {
+    let value = request(kelvos_shared_ring::SYS_WAIT_CHILD, u64::from(pid.get()), 0)?;
+    ExitStatus::decode(value).ok_or(Error::Protocol)
+}
+
+/// Collects the child's status if available, returning immediately otherwise.
+pub fn try_wait_child(pid: Pid) -> Result<Option<ExitStatus>, Error> {
+    match request(
+        kelvos_shared_ring::SYS_WAIT_CHILD,
+        u64::from(pid.get()),
+        kelvos_shared_ring::WAIT_NO_HANG,
+    ) {
+        Err(Error::Kernel(-11)) => Ok(None),
+        result => ExitStatus::decode(result?).map(Some).ok_or(Error::Protocol),
+    }
+}
+
+/// Terminates the current process with status zero.
+#[cfg(target_os = "none")]
+pub fn exit() -> ! {
+    exit_with(0)
+}
+
+/// Terminates the current process with the supplied status.
+#[cfg(target_os = "none")]
+pub fn exit_with(code: u32) -> ! {
+    let _ = syscall::call(kelvos_shared_ring::SYS_EXIT, u64::from(code), 0);
+    panic!("exit syscall returned")
 }
 
 /// Spins indefinitely without issuing a scheduler or wait syscall.
@@ -122,21 +90,5 @@ pub fn spawn() -> Result<TaskId, Error> {
 pub fn idle_forever() -> ! {
     loop {
         core::hint::spin_loop();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn task_id_exposes_kernel_identifier() {
-        assert_eq!(TaskId(7).get(), 7);
-    }
-
-    #[cfg(not(target_os = "none"))]
-    #[test]
-    fn spawn_is_unavailable_outside_freestanding_targets() {
-        assert_eq!(spawn(), Err(Error::UnsupportedPlatform));
     }
 }
